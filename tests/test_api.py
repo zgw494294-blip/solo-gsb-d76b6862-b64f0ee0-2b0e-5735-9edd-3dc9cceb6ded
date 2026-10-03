@@ -535,6 +535,200 @@ def test_split_then_merge_and_merge_then_split():
 
 
 # --------------------------------------------------------------------------- #
+# 复制
+# --------------------------------------------------------------------------- #
+def _duplicate(order, bodies, selected_ids, id_bound):
+    return client.post(
+        "/api/duplicate",
+        json={
+            "order_ids": order,
+            "clauses": bodies,
+            "selected_ids": selected_ids,
+            "id_bound": id_bound,
+        },
+    )
+
+
+def test_duplicate_single_clause_inserts_copy_right_after():
+    bodies = _bodies(import_text(GOOD).json())
+    r = _duplicate(ids4(), bodies, ["c2"], 4)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # 副本插在所选条款之后，取得高于上界的新身份；上界随之更新
+    assert data["order_ids"] == ["c1", "c2", "c5", "c3", "c4"]
+    assert data["id_bound"] == 5
+    by = {c["id"]: c["body"] for c in data["clauses"]}
+    # 原条款正文不变；副本正文相同（[[c1]] 为组外引用，保留原目标）
+    assert by["c2"] == "乙方按 [[c1]] 验收后付款"
+    assert by["c5"] == "乙方按 [[c1]] 验收后付款"
+
+
+def test_duplicate_group_repoints_intra_group_refs_only():
+    bodies = _bodies(import_text(GOOD).json())
+    # 选 c1、c2（c2 引用 c1，属组内引用）
+    r = _duplicate(ids4(), bodies, ["c1", "c2"], 4)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # 整组按当前显示顺序插在所选最后一条（c2）之后
+    assert data["order_ids"] == ["c1", "c2", "c5", "c6", "c3", "c4"]
+    assert data["id_bound"] == 6
+    by = {c["id"]: c["body"] for c in data["clauses"]}
+    # 副本 c6（复制自 c2）中指向组内 c1 的引用改指相应副本 c5
+    assert by["c6"] == "乙方按 [[c5]] 验收后付款"
+    # 原条款及其引用均不变
+    assert by["c2"] == "乙方按 [[c1]] 验收后付款"
+    # 组外条款 c3 对 c2 的引用保留原目标，不被改指副本
+    assert by["c3"] == "争议解决见 [[c4]]，违约参照 [[c2]]"
+
+
+def test_duplicate_self_ref_points_to_copy():
+    bodies = _bodies(import_text(GOOD).json())
+    # 先给 c2 加一个自引用（当前第 2 位就是 c2）
+    r = client.post(
+        "/api/save",
+        json={
+            "order_ids": ids4(),
+            "clauses": bodies,
+            "edit_id": "c2",
+            "text": "乙方按 [[1]] 验收后付款，并见 [[2]] 末款",
+        },
+    )
+    assert r.status_code == 200
+    bodies = [b if b["id"] != "c2" else {"id": "c2", "body": r.json()["body"]} for b in bodies]
+    r = _duplicate(ids4(), bodies, ["c2"], 4)
+    assert r.status_code == 200, r.text
+    by = {c["id"]: c["body"] for c in r.json()["clauses"]}
+    # 副本中的自引用改指副本自身；组外引用 [[c1]] 保留；原条款不变
+    assert by["c5"] == "乙方按 [[c1]] 验收后付款，并见 [[c5]] 末款"
+    assert by["c2"] == "乙方按 [[c1]] 验收后付款，并见 [[c2]] 末款"
+
+
+def test_duplicate_follows_display_order_and_inserts_after_last_selected():
+    bodies = _bodies(import_text(GOOD).json())
+    order = ["c4", "c1", "c2", "c3"]
+    # 选显示顺序第 1、3 位的 c4 与 c2，传入顺序故意颠倒：仍按当前显示顺序复制
+    r = _duplicate(order, bodies, ["c2", "c4"], 4)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # 副本按显示顺序排列（c4 的副本在前），整组插在所选最后一条 c2 之后
+    assert data["order_ids"] == ["c4", "c1", "c2", "c5", "c6", "c3"]
+    by = {c["id"]: c["body"] for c in data["clauses"]}
+    assert by["c5"] == by["c4"] == "争议提交仲裁"
+    assert by["c6"] == by["c2"] == "乙方按 [[c1]] 验收后付款"
+
+
+def test_duplicate_keeps_broken_refs_broken():
+    bodies = _bodies(import_text(GOOD).json())
+    # 删除 c4：c3 中 [[c4]] 失效；复制 c3 后副本中的失效引用仍失效
+    order = ["c1", "c2", "c3"]
+    bodies3 = [b for b in bodies if b["id"] != "c4"]
+    r = _duplicate(order, bodies3, ["c3"], 4)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    by = {c["id"]: c["body"] for c in data["clauses"]}
+    assert by["c5"] == "争议解决见 [[c4]]，违约参照 [[c2]]"
+    r = client.post("/api/preview", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    preview = r.json()
+    assert preview["has_broken"] is True
+    c5 = next(it for it in preview["items"] if it["id"] == "c5")
+    assert c5["broken"] == [{"ref_id": "c4", "original": 4}]
+    assert "[[原4?]]" in c5["text"]
+    r = client.post("/api/export", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    assert r.status_code == 409
+
+
+def test_duplicate_rejects_empty_duplicate_and_missing_selection():
+    bodies = _bodies(import_text(GOOD).json())
+    # 未选
+    r = _duplicate(ids4(), bodies, [], 4)
+    assert r.status_code == 422
+    # 选择重复
+    r = _duplicate(ids4(), bodies, ["c1", "c1"], 4)
+    assert r.status_code == 422
+    # 所选条款不存在
+    r = _duplicate(ids4(), bodies, ["c9"], 4)
+    assert r.status_code == 422
+    # 失败不改草稿：原草稿仍可正常预览
+    r = client.post("/api/preview", json={"order_ids": ids4(), "clauses": bodies})
+    assert r.status_code == 200
+    assert len(r.json()["items"]) == 4
+
+
+def test_duplicate_count_limit_40():
+    text = "\n".join(f"{i}|条款{i}" for i in range(1, 41))  # 40 条
+    bodies = _bodies(import_text(text).json())
+    order = [f"c{i}" for i in range(1, 41)]
+    # 40 条时复制 1 条 → 41 条：拒绝
+    r = _duplicate(order, bodies, ["c1"], 40)
+    assert r.status_code == 422
+    # 39 条时复制 1 条 → 40 条：允许
+    r = _duplicate(order[:-1], bodies[:-1], ["c1"], 39)
+    assert r.status_code == 200, r.text
+    assert r.json()["order_ids"] == ["c1", "c40"] + [f"c{i}" for i in range(2, 40)]
+    assert r.json()["id_bound"] == 40
+
+
+def test_duplicate_id_bound_must_exceed_used_identities():
+    bodies = _bodies(import_text(GOOD).json())
+    # 上界过低：副本新身份与现有条款冲突
+    r = _duplicate(ids4(), bodies, ["c1"], 2)
+    assert r.status_code == 422
+    # 删除 c4 后，c3 中 [[c4]] 失效；上界 3 会让副本复用已移除身份 c4、复活失效引用：拒绝
+    order = ["c1", "c2", "c3"]
+    bodies3 = [b for b in bodies if b["id"] != "c4"]
+    r = _duplicate(order, bodies3, ["c1"], 3)
+    assert r.status_code == 422
+    # 上界高于已用身份（4）时成功，失效引用保持失效
+    r = _duplicate(order, bodies3, ["c1"], 4)
+    assert r.status_code == 200, r.text
+    r = client.post("/api/preview", json={"order_ids": r.json()["order_ids"], "clauses": r.json()["clauses"]})
+    assert r.json()["has_broken"] is True
+
+
+def test_duplicate_and_split_share_updated_bound():
+    bodies = _bodies(import_text(GOOD).json())
+    # 复制两条：上界 4 → 6
+    r = _duplicate(ids4(), bodies, ["c1", "c2"], 4)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["id_bound"] == 6
+    # 拆分沿用复制更新后的上界：c7 为全新身份，成功
+    r = _split(data["order_ids"], data["clauses"], "c3", 2, f"c{data['id_bound'] + 1}")
+    assert r.status_code == 200, r.text
+    # 复用已被副本占用的身份（c5）拆分：拒绝
+    r = _split(data["order_ids"], data["clauses"], "c3", 2, "c5")
+    assert r.status_code == 422
+
+
+def test_duplicate_preview_export_and_reorder_stability():
+    bodies = _bodies(import_text(GOOD).json())
+    r = _duplicate(ids4(), bodies, ["c1", "c2"], 4)
+    data = r.json()
+    # 预览 / 导出立即对应同一份草稿
+    r = client.post("/api/preview", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    items = {it["id"]: it for it in r.json()["items"]}
+    assert r.json()["has_broken"] is False
+    assert items["c5"]["display"] == 3
+    assert items["c6"]["text"] == "乙方按 [[3]] 验收后付款"  # 组内引用指向副本 c5（第 3 位）
+    r = client.post("/api/export", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    assert r.status_code == 200
+    assert r.json()["text"].split("\n") == [
+        "1|甲方在七日内交付设备",
+        "2|乙方按 [[1]] 验收后付款",
+        "3|甲方在七日内交付设备",
+        "4|乙方按 [[3]] 验收后付款",
+        "5|争议解决见 [[6]]，违约参照 [[2]]",
+        "6|争议提交仲裁",
+    ]
+    # 后续重排仍按稳定身份绑定：副本组移到首部，引用不转指占用旧号的条款
+    order = ["c5", "c6", "c1", "c2", "c3", "c4"]
+    r = client.post("/api/preview", json={"order_ids": order, "clauses": data["clauses"]})
+    items = {it["id"]: it for it in r.json()["items"]}
+    assert items["c6"]["text"] == "乙方按 [[1]] 验收后付款"  # 仍指副本 c5
+    assert items["c2"]["text"] == "乙方按 [[3]] 验收后付款"  # 仍指原 c1
+
+
+# --------------------------------------------------------------------------- #
 # 原稿对照 /api/diff
 # --------------------------------------------------------------------------- #
 def _state(doc, order=None):
@@ -635,6 +829,25 @@ def test_diff_split_is_front_body_change_and_back_added_without_move():
     assert c5["baseline_no"] is None and c5["current_no"] == 3
     assert c5["baseline_text"] is None
     assert c5["current_text"] == "按 [[1]] 验收后付款"
+    assert data["invalid_refs"] == []
+
+
+def test_diff_duplicate_marks_copies_added_without_move():
+    doc = import_text(GOOD).json()
+    base = _state(doc)
+    r = _duplicate(base["order_ids"], base["clauses"], ["c1", "c2"], 4)
+    assert r.status_code == 200, r.text
+    cur = {"order_ids": r.json()["order_ids"], "clauses": r.json()["clauses"]}
+    data = _diff(base, cur).json()
+    # 副本记新增（按当前顺序排列）；插入造成的编号平移不算移动，原条款无变化
+    assert [(it["id"], it["tags"]) for it in data["items"]] == [
+        ("c5", ["added"]),
+        ("c6", ["added"]),
+    ]
+    c6 = next(it for it in data["items"] if it["id"] == "c6")
+    assert c6["baseline_no"] is None and c6["current_no"] == 4
+    assert c6["baseline_text"] is None
+    assert c6["current_text"] == "乙方按 [[3]] 验收后付款"  # 组内引用已改指副本 c5
     assert data["invalid_refs"] == []
 
 

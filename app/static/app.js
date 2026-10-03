@@ -7,11 +7,11 @@ const state = {
   clauses: [], // { id, original, body(内部形态 [[c3]]) }
   orderIds: [],
   editingId: null,
-  mergeIds: [], // 勾选待合并的两条条款 id
+  selectedIds: [], // 勾选的条款 id：合并需恰好两条，复制一条或多条（均按当前显示顺序处理）
   splittingId: null, // 打开拆分选择器的条款 id（打开期间阻止其他改稿操作）
   splitOffset: null, // 拆分分界：内部正文中的字符位置（按 Unicode 码位计，与后端一致）
   splitRefsTo: "front", // 原指向被拆条款的引用落到 front（前段）还是 back（后段）
-  idCounter: 0, // 本草稿已用过的最大身份号：拆分新段取 idCounter+1，删除/合并移除的身份不复用
+  idCounter: 0, // 本草稿已用过的最大身份号：拆分/复制新身份从 idCounter+1 起，删除/合并移除的身份不复用
   preview: null, // 服务端 /api/preview 返回；仅当 previewFresh 为真时与当前草稿对应
   previewError: null, // 最近一次预览失败的错误信息（数组）；成功一次或重新导入后清空
   renderedRev: null, // 页面当前 DOM 所呈现草稿的修订号；预览失败时据此判断列表是否停留在旧编号
@@ -25,6 +25,7 @@ const state = {
   saving: false, // /api/save 在途
   merging: false, // /api/merge 在途（期间阻止编辑 / 删除 / 重排 / 勾选 / 重复合并）
   splitting: false, // /api/split 在途（期间阻止其他改稿）
+  duplicating: false, // /api/duplicate 在途（期间阻止其他改稿与重复提交）
   exporting: false, // /api/export 在途
   baseline: null, // 成功导入后不可变的原稿基线（{ order_ids, clauses }，深拷贝）；重新导入清空
   diffOpen: false, // 原稿对照面板是否展开
@@ -33,7 +34,7 @@ const state = {
   diffFresh: false, // 面板内容是否已追上当前草稿；改稿立即为 false
 };
 
-const MAX_CLAUSES = 40; // 与后端 MAX_LINES 一致：拆分后总数不能超过它
+const MAX_CLAUSES = 40; // 与后端 MAX_LINES 一致：拆分 / 复制后总数不能超过它
 
 let previewSeq = 0; // 预览请求序号：只采用最后一次发出的预览响应
 let exportSeq = 0; // 下载请求序号：只有仍持有它的下载能收尾按钮；重新导入 / 新下载会作废旧下载的收尾权
@@ -56,6 +57,7 @@ const brokenBanner = $("#broken-banner");
 const previewErrorBanner = $("#preview-error-banner");
 const downloadBtn = $("#download-btn");
 const mergeBtn = $("#merge-btn");
+const copyBtn = $("#copy-btn");
 const diffBtn = $("#diff-btn");
 const diffPanel = $("#diff-panel");
 const diffStatus = $("#diff-status");
@@ -148,18 +150,19 @@ function touch() {
 
 function syncToolbar() {
   updateMergeBtn();
+  updateCopyBtn();
   updateDownloadBtn();
   syncBusy();
 }
 
 // 列表是否应整体暂停操作（置灰、拦截事件，结束后自动恢复）：
-// - 合并 / 拆分提交在途；
+// - 合并 / 拆分 / 复制提交在途；
 // - 预览失败且页面停留在旧编号（renderedRev 与当前草稿不一致）；
 // - 预览失败且刚打开的拆分选择器 / 编辑器尚未渲染出来（DOM 里没有对应入口）。
 // 已成功渲染的拆分选择器在预览失败时仍可继续操作（选分界、确认、取消），
 // 其重试入口在失败横幅上。
 function listLocked() {
-  if (state.merging || state.splitting) return true;
+  if (state.merging || state.splitting || state.duplicating) return true;
   if (state.previewError === null) return false;
   if (state.renderedRev !== state.rev) return true;
   if (state.splittingId !== null && state.renderedSplittingId !== state.splittingId) return true;
@@ -209,14 +212,34 @@ function updateMergeBtn() {
     mergeBtn.textContent = "合并中…";
     return;
   }
+  // 合并仍只允许两条：勾选数不为 2 时保持禁用
   mergeBtn.disabled =
     state.editingId !== null ||
     state.splittingId !== null ||
     state.splitting ||
+    state.duplicating ||
     !state.previewFresh ||
-    state.mergeIds.length !== 2;
+    state.selectedIds.length !== 2;
   mergeBtn.textContent =
-    state.mergeIds.length === 2 ? "合并所选（2 条）" : "合并所选";
+    state.selectedIds.length === 2 ? "合并所选（2 条）" : "合并所选";
+}
+
+function updateCopyBtn() {
+  if (state.duplicating) {
+    copyBtn.disabled = true;
+    copyBtn.textContent = "复制中…";
+    return;
+  }
+  // 复制一条或多条：未保存编辑或拆分选择未结束时不能复制
+  copyBtn.disabled =
+    state.editingId !== null ||
+    state.splittingId !== null ||
+    state.merging ||
+    state.splitting ||
+    !state.previewFresh ||
+    state.selectedIds.length < 1;
+  copyBtn.textContent =
+    state.selectedIds.length >= 1 ? `复制所选（${state.selectedIds.length} 条）` : "复制所选";
 }
 
 function updateDownloadBtn() {
@@ -224,6 +247,7 @@ function updateDownloadBtn() {
     state.exporting ||
     state.merging ||
     state.splitting ||
+    state.duplicating ||
     !state.previewFresh ||
     !state.preview ||
     state.preview.has_broken;
@@ -260,12 +284,13 @@ importBtn.addEventListener("click", async () => {
     }));
     state.orderIds = state.clauses.map((c) => c.id);
     state.editingId = null;
-    state.mergeIds = [];
+    state.selectedIds = [];
     state.splittingId = null;
     state.splitOffset = null;
     state.splitRefsTo = "front";
     state.splitting = false;
-    state.idCounter = data.clauses.length; // 导入身份为 c1..cN，拆分新身份从 N+1 起
+    state.duplicating = false;
+    state.idCounter = data.clauses.length; // 导入身份为 c1..cN，拆分/复制新身份从 N+1 起
     // 成功导入建立不可变原稿基线（深拷贝），同时收起并清空旧对照
     state.baseline = {
       order_ids: state.orderIds.slice(),
@@ -309,7 +334,7 @@ $("#reimport-btn").addEventListener("click", () => {
   state.clauses = [];
   state.orderIds = [];
   state.editingId = null;
-  state.mergeIds = [];
+  state.selectedIds = [];
   state.splittingId = null;
   state.splitOffset = null;
   state.splitRefsTo = "front";
@@ -331,6 +356,7 @@ $("#reimport-btn").addEventListener("click", () => {
   state.saving = false;
   state.merging = false;
   state.splitting = false;
+  state.duplicating = false;
   state.exporting = false;
   exportSeq += 1; // 作废旧下载对等待状态的收尾权：其成功或失败都不得解锁新草稿的下载按钮
   previewInFlight = false; // 上一草稿在途预览的收尾将因世代不符而直接返回，这里复位在途态
@@ -428,7 +454,7 @@ async function renderPreview(epoch, rev, seq) {
     li.className =
       "card" +
       (item.broken.length ? " source-broken" : "") +
-      (state.mergeIds.includes(item.id) ? " selected" : "");
+      (state.selectedIds.includes(item.id) ? " selected" : "");
     li.id = `card-${item.id}`;
     li.dataset.id = item.id;
 
@@ -438,8 +464,8 @@ async function renderPreview(epoch, rev, seq) {
     const atMax = state.orderIds.length >= MAX_CLAUSES;
     li.innerHTML = `
       <div class="card-head">
-        <input type="checkbox" class="merge-pick" title="勾选后与另一条合并（按当前显示顺序）"
-          ${state.mergeIds.includes(item.id) ? "checked" : ""}
+        <input type="checkbox" class="merge-pick" title="勾选后可合并（恰好两条）或复制（一条或多条）"
+          ${state.selectedIds.includes(item.id) ? "checked" : ""}
           ${locked ? "disabled" : ""} />
         <span class="grip" title="拖拽调整顺序">⠿</span>
         <span class="num">${item.display}</span>
@@ -507,7 +533,7 @@ async function renderPreview(epoch, rev, seq) {
   state.renderedRev = rev;
   state.renderedSplittingId = state.splittingId;
   state.renderedEditingId = state.editingId;
-  clauseList.classList.toggle("busy", state.merging || state.splitting);
+  clauseList.classList.toggle("busy", state.merging || state.splitting || state.duplicating);
   syncToolbar();
 
   // 拆分选择器打开时，按当前状态恢复其分界选中态与按钮可用态
@@ -754,23 +780,19 @@ clauseList.addEventListener("change", (ev) => {
   const pick = ev.target.closest(".merge-pick");
   if (!pick) return;
   const id = pick.closest(".card").dataset.id;
-  if (state.merging || state.splitting || listLocked()) {
-    pick.checked = state.mergeIds.includes(id); // 合并/拆分提交或预览锁定期间不允许改动选择
+  if (state.merging || state.splitting || state.duplicating || listLocked()) {
+    pick.checked = state.selectedIds.includes(id); // 合并/拆分/复制提交或预览锁定期间不允许改动选择
     return;
   }
+  // 勾选数量不限：合并按钮仅在恰好两条时可用，复制按钮一条或多条即可
   if (pick.checked) {
-    if (state.mergeIds.length >= 2) {
-      // 一次只能合并两条：取消本次勾选并提示
-      pick.checked = false;
-      alert("一次只能合并两条条款：请先取消已勾选的条款。");
-      return;
-    }
-    state.mergeIds.push(id);
+    state.selectedIds.push(id);
   } else {
-    state.mergeIds = state.mergeIds.filter((x) => x !== id);
+    state.selectedIds = state.selectedIds.filter((x) => x !== id);
   }
   document.getElementById(`card-${id}`).classList.toggle("selected", pick.checked);
   updateMergeBtn();
+  updateCopyBtn();
 });
 
 mergeBtn.addEventListener("click", async () => {
@@ -779,10 +801,10 @@ mergeBtn.addEventListener("click", async () => {
     alert("请先保存或取消正在编辑的正文，再合并条款。");
     return;
   }
-  if (state.mergeIds.length !== 2 || !state.previewFresh || !state.preview) return;
+  if (state.selectedIds.length !== 2 || !state.previewFresh || !state.preview) return;
 
   // 按当前显示顺序确定较前 / 较后条款
-  const [a, b] = state.mergeIds;
+  const [a, b] = state.selectedIds;
   const keepId = state.orderIds.indexOf(a) < state.orderIds.indexOf(b) ? a : b;
   const dropId = keepId === a ? b : a;
   const previewById = Object.fromEntries(state.preview.items.map((it) => [it.id, it]));
@@ -823,7 +845,7 @@ mergeBtn.addEventListener("click", async () => {
       original: parseInt(c.id.slice(1), 10),
       body: c.body,
     }));
-    state.mergeIds = [];
+    state.selectedIds = [];
     state.merging = false;
     touch();
     render();
@@ -833,6 +855,80 @@ mergeBtn.addEventListener("click", async () => {
     state.merging = false;
     alert("合并失败，草稿未改动：\n" + errorList(e).join("\n"));
   } finally {
+    if (epoch === state.epoch) {
+      syncBusy();
+      syncToolbar();
+    }
+  }
+});
+
+// --------------------------------------------------------------------------- //
+// 复制一组条款（一条或多条，按当前显示顺序，整组插在所选最后一条之后）
+// --------------------------------------------------------------------------- //
+copyBtn.addEventListener("click", async () => {
+  if (state.duplicating) return; // 阻止重复提交
+  if (state.editingId) {
+    alert("请先保存或取消正在编辑的正文，再复制条款。");
+    return;
+  }
+  if (state.splittingId) {
+    alert("请先确认或取消正在进行的拆分，再复制条款。");
+    return;
+  }
+  if (state.selectedIds.length < 1 || !state.previewFresh || !state.preview) return;
+  const total = state.orderIds.length + state.selectedIds.length;
+  if (total > MAX_CLAUSES) {
+    alert(`复制后共 ${total} 条，超过上限 ${MAX_CLAUSES} 条，不能复制。`);
+    return;
+  }
+
+  // 按当前显示顺序复制（与勾选先后无关），整组插在所选最后一条之后
+  const selectedInOrder = state.orderIds.filter((id) => state.selectedIds.includes(id));
+  const previewById = Object.fromEntries(state.preview.items.map((it) => [it.id, it]));
+  const lines = selectedInOrder.map((id) => {
+    const it = previewById[id];
+    return `第 ${it.display} 条（原第 ${it.original} 条）：${it.text}`;
+  });
+  const last = previewById[selectedInOrder[selectedInOrder.length - 1]];
+  const msg =
+    `将按当前显示顺序复制以下 ${selectedInOrder.length} 条条款：\n\n` +
+    lines.join("\n") +
+    `\n\n副本整组插在第 ${last.display} 条之后，取得高于已用身份上界的全新身份；` +
+    `副本中指向组内条款的引用（含自引用）改指相应副本，组外引用与失效引用保持不变，` +
+    `原条款不受影响。\n此操作在重新导入或刷新前不可撤销，确定复制？`;
+  if (!confirm(msg)) return;
+
+  const epoch = state.epoch;
+  // 提交期间阻止其他改稿（列表置灰），成功或失败后恢复
+  state.duplicating = true;
+  syncBusy();
+  syncToolbar();
+  try {
+    const data = await api("/api/duplicate", {
+      ...snapshot(),
+      selected_ids: selectedInOrder,
+      id_bound: state.idCounter, // 复制与拆分共用同一身份上界
+    });
+    if (epoch !== state.epoch) return; // 已重新导入：旧复制结果不得写回新草稿
+    // 仅在服务端成功后才改动草稿，保证列表 / 预览 / 对照 / 下载立即对应同一份草稿
+    state.orderIds = data.order_ids;
+    state.clauses = data.clauses.map((c) => ({
+      id: c.id,
+      original: parseInt(c.id.slice(1), 10),
+      body: c.body,
+    }));
+    state.idCounter = data.id_bound; // 上界更新：后续拆分 / 复制从新高起分配，已移除身份不复用
+    state.selectedIds = [];
+    state.duplicating = false;
+    touch();
+    render();
+  } catch (e) {
+    if (epoch !== state.epoch) return; // 旧草稿的失败不在新草稿上提示
+    // 复制失败：草稿未改动，勾选保持不变，可修正后重试
+    state.duplicating = false;
+    alert("复制失败，草稿未改动：\n" + errorList(e).join("\n"));
+  } finally {
+    // 重新导入后，旧请求的收尾不得改动新稿的列表状态、提示或按钮
     if (epoch === state.epoch) {
       syncBusy();
       syncToolbar();
@@ -910,7 +1006,7 @@ clauseList.addEventListener("click", async (ev) => {
     if (!confirm(msg)) return;
     state.orderIds = state.orderIds.filter((x) => x !== id);
     state.clauses = state.clauses.filter((c) => c.id !== id);
-    state.mergeIds = state.mergeIds.filter((x) => x !== id);
+    state.selectedIds = state.selectedIds.filter((x) => x !== id);
     touch();
     render();
   } else if (action === "cancel") {
