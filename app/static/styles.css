@@ -131,7 +131,7 @@ button.danger:hover:not(:disabled) { background: var(--danger-bg); }
 @media (max-width: 920px) { .columns { grid-template-columns: 1fr; } }
 
 .clause-list { list-style: none; margin: 0; padding: 0; }
-/* 合并提交期间：暂时锁定列表内的编辑 / 删除 / 重排 / 勾选，结束后自动恢复 */
+/* 合并 / 拆分 / 复制提交期间：暂时锁定列表内的编辑 / 删除 / 重排 / 勾选，结束后自动恢复 */
 .clause-list.busy { pointer-events: none; opacity: 0.55; }
 
 .card {
@@ -147,8 +147,8 @@ button.danger:hover:not(:disabled) { background: var(--danger-bg); }
 .card.selected { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.22); background: #f7faff; }
 .card:has(.editor), .card:has(.splitter) { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15); background: #fff; }
 
-.merge-pick { width: 15px; height: 15px; accent-color: var(--primary); cursor: pointer; flex: none; }
-.merge-pick:disabled { cursor: not-allowed; }
+.pick { width: 15px; height: 15px; accent-color: var(--primary); cursor: pointer; flex: none; }
+.pick:disabled { cursor: not-allowed; }
 
 .card-head {
   display: flex;

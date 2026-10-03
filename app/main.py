@@ -15,6 +15,11 @@
   本草稿从未用过的全新 id（被删除或合并移除的 id 不复用，已有失效引用不会因此复活）；
   指向被拆条款的全部引用（含两段中的自引用）按请求统一改指前段或后段，其余引用不动；
   新条款在顺序表中紧跟前段，其余条款相对顺序不变。
+- 复制一组条款时，按当前显示顺序为所选条款生成可独立编辑的副本，整组插在所选
+  最后一条之后；原条款的正文、身份、相对顺序与引用均不变。副本正文中指向组内
+  条款的引用（含自引用）改指相应副本，指向组外条款的引用保留原目标，已失效引用
+  保持失效。副本身份高于调用方给出的已用身份上界（与拆分共用同一上界，被删除或
+  合并移除的身份不复用，已有失效引用不会因此复活），接口返回更新后的上界。
 
 原稿对照（``POST /api/diff``）：
 - 入参为两份沿用现有草稿结构的文档：成功导入后不可变的原稿基线（baseline）与
@@ -23,7 +28,7 @@
   移动（moved），标签可并存。正文按内部引用绑定比较：仅显示编号变化不算正文改动。
 - 移动只计基线与现稿中都仍存在、且彼此先后颠倒的条款；删除或拆分插入造成的
   编号平移不算移动。合并记保留身份的正文改动与另一身份删除；拆分记前段正文改动、
-  后段新增。
+  后段新增；复制记各副本（新身份）的新增，原条款不变。
 - 正文未变但某条引用由基线中的有效引用变成现稿失效引用时，另列引用来源条款与位置。
 - 现存项按当前顺序排列，删除项随后按基线顺序排列；没有任何变化时 has_changes 为假。
 """
@@ -97,6 +102,13 @@ class DiffIn(BaseModel):
     # 成功导入后保留的不可变原稿基线；两份文档均沿用现有草稿结构
     baseline: StateIn
     current: StateIn
+
+
+class DuplicateIn(BaseModel):
+    order_ids: list[str]
+    clauses: list[ClauseIn]
+    selected_ids: list[str]  # 要复制的条款身份；按当前显示顺序复制整组
+    next_id: int  # 已用身份上界：副本新身份从 next_id + 1 起依次分配
 
 
 # --------------------------------------------------------------------------- #
@@ -428,6 +440,90 @@ def split_clause(payload: SplitIn):
         if cid == payload.split_id:
             new_order.append(payload.new_id)
     return {"order_ids": new_order, "clauses": split}
+
+
+@app.post("/api/duplicate")
+def duplicate_clauses(payload: DuplicateIn):
+    """把所选一组条款复制为可独立编辑的副本。
+
+    - 按当前显示顺序复制整组（与所选身份的传入顺序无关），副本整组插在所选
+      最后一条之后；原条款的正文、身份、相对顺序与引用均不变。
+    - 副本正文中指向组内条款的引用（含自引用）改指相应副本；指向组外条款的
+      引用保留原目标；已失效引用（目标不在草稿内）保持失效。
+    - 副本身份从 ``next_id + 1`` 起依次分配（与拆分共用同一身份上界）：
+      不得与现有条款重复，也不得出现在任何正文的引用中（被删除/合并移除的
+      身份不能复用，已有失效引用不能因此复活）。返回更新后的上界。
+    """
+    by_id = _validate_state(payload.order_ids, payload.clauses)
+    errors: list[str] = []
+    if not payload.selected_ids:
+        errors.append("未选择要复制的条款")
+    seen: set[str] = set()
+    for sel in payload.selected_ids:
+        if sel in seen:
+            errors.append(f"所选条款重复：{sel}")
+        seen.add(sel)
+    for sel in payload.selected_ids:
+        if sel not in by_id:
+            errors.append(f"所选条款不存在：{sel}")
+    if payload.next_id < 0:
+        errors.append("身份上界非法：须为不小于 0 的整数")
+    total = len(payload.order_ids) + len(payload.selected_ids)
+    if total > MAX_LINES:
+        errors.append(f"复制后共 {total} 条，超过上限 {MAX_LINES} 条，不能复制")
+    if errors:
+        raise HTTPException(422, detail={"errors": errors})
+
+    # 按当前显示顺序确定复制顺序、身份分配与插入位置
+    selected = [cid for cid in payload.order_ids if cid in seen]
+    new_ids = [f"c{payload.next_id + i + 1}" for i in range(len(selected))]
+
+    # 新身份不得与现有条款重复，也不得出现在任何正文的引用中：
+    # 避免复用已删除/已合并移除的身份、复活失效引用（上界过期时拒绝）
+    conflicts: list[str] = []
+    for new_id in new_ids:
+        if new_id in by_id:
+            conflicts.append(f"副本新身份 {new_id} 已被现有条款占用（身份上界已过期）")
+    fresh = set(new_ids)
+    for clause in payload.clauses:
+        for m in MARKER_RE.finditer(clause.body):
+            if m.group(1) in fresh:
+                conflicts.append(
+                    f"副本新身份 {m.group(1)} 与既有引用冲突"
+                    "（该身份在本草稿中已被使用过，不能复用）"
+                )
+    if conflicts:
+        raise HTTPException(422, detail={"errors": conflicts})
+
+    mapping = dict(zip(selected, new_ids))
+
+    def repoint(m: re.Match) -> str:
+        target = mapping.get(m.group(1))
+        return f"[[{target}]]" if target else m.group(0)
+
+    copies = [
+        {"id": new_id, "body": MARKER_RE.sub(repoint, by_id[old_id].body)}
+        for old_id, new_id in zip(selected, new_ids)
+    ]
+    last_selected = selected[-1]
+
+    clauses: list[dict] = []
+    for clause in payload.clauses:
+        clauses.append({"id": clause.id, "body": clause.body})
+        if clause.id == last_selected:
+            clauses.extend(copies)
+
+    new_order: list[str] = []
+    for cid in payload.order_ids:
+        new_order.append(cid)
+        if cid == last_selected:
+            new_order.extend(new_ids)
+
+    return {
+        "order_ids": new_order,
+        "clauses": clauses,
+        "next_id": payload.next_id + len(new_ids),
+    }
 
 
 @app.post("/api/preview")

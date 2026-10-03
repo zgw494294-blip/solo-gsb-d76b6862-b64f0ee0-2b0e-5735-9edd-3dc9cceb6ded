@@ -39,6 +39,7 @@
         </div>
         <div class="toolbar-right">
           <button id="merge-btn" disabled>合并所选</button>
+          <button id="duplicate-btn" disabled>复制所选</button>
           <button id="diff-btn">对照原稿</button>
           <button id="reimport-btn">重新导入</button>
           <button id="download-btn" class="primary" disabled>下载纯文本</button>
@@ -70,7 +71,7 @@
       <div class="columns">
         <div class="panel">
           <h2>条款列表</h2>
-          <p class="hint">用 ↑↓ 或拖拽 ⠿ 调整顺序；勾选两条不同条款后点「合并所选」可按当前显示顺序合并；点「拆分」可在选定分界处把一条已保存正文拆成前后两条（原指向本条的引用可选落前段或后段）；编号为当前显示编号，引用始终指向导入时绑定的条款。</p>
+          <p class="hint">用 ↑↓ 或拖拽 ⠿ 调整顺序；勾选两条不同条款后点「合并所选」可按当前显示顺序合并；勾选一条或多条后点「复制所选」可在所选最后一条之后生成整组可独立编辑的副本；点「拆分」可在选定分界处把一条已保存正文拆成前后两条（原指向本条的引用可选落前段或后段）；编号为当前显示编号，引用始终指向导入时绑定的条款。</p>
           <ol id="clause-list" class="clause-list"></ol>
         </div>
 

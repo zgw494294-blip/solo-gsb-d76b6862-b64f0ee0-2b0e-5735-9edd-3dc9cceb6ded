@@ -535,6 +535,195 @@ def test_split_then_merge_and_merge_then_split():
 
 
 # --------------------------------------------------------------------------- #
+# 复制
+# --------------------------------------------------------------------------- #
+def _dup(order, bodies, selected, next_id):
+    return client.post(
+        "/api/duplicate",
+        json={
+            "order_ids": order,
+            "clauses": bodies,
+            "selected_ids": selected,
+            "next_id": next_id,
+        },
+    )
+
+
+def test_duplicate_group_copies_in_display_order_and_repoints_internal_refs():
+    bodies = _bodies(import_text(GOOD).json())
+    # 选择 c2、c3（当前顺序即显示顺序）：整组副本插在所选最后一条 c3 之后
+    r = _dup(ids4(), bodies, ["c2", "c3"], 4)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["order_ids"] == ["c1", "c2", "c3", "c5", "c6", "c4"]
+    assert data["next_id"] == 6  # 上界随副本数量推进
+    by = {c["id"]: c["body"] for c in data["clauses"]}
+    # 原条款正文、身份、相对顺序与引用均不变
+    assert by["c2"] == "乙方按 [[c1]] 验收后付款"
+    assert by["c3"] == "争议解决见 [[c4]]，违约参照 [[c2]]"
+    # 副本 c5（复制 c2）：指向组外 c1 的引用保留原目标
+    assert by["c5"] == "乙方按 [[c1]] 验收后付款"
+    # 副本 c6（复制 c3）：指向组内 c2 的引用改指相应副本 c5；组外 c4 保留
+    assert by["c6"] == "争议解决见 [[c4]]，违约参照 [[c5]]"
+
+    # 预览 / 导出立即对应同一份草稿
+    r = client.post("/api/preview", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    items = {it["id"]: it for it in r.json()["items"]}
+    assert r.json()["has_broken"] is False
+    assert items["c5"]["display"] == 4
+    assert items["c6"]["text"] == "争议解决见 [[6]]，违约参照 [[4]]"
+    r = client.post("/api/export", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    assert r.status_code == 200
+
+
+def test_duplicate_self_reference_repoints_to_copy():
+    doc = import_text("1|本条说明自身 [[1]]\n2|普通条款").json()
+    bodies = _bodies(doc)
+    r = _dup(["c1", "c2"], bodies, ["c1"], 2)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["order_ids"] == ["c1", "c3", "c2"]
+    assert data["next_id"] == 3
+    by = {c["id"]: c["body"] for c in data["clauses"]}
+    assert by["c1"] == "本条说明自身 [[c1]]"  # 原条款不变
+    assert by["c3"] == "本条说明自身 [[c3]]"  # 副本的自引用改指副本自身
+    r = client.post("/api/preview", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    items = {it["id"]: it for it in r.json()["items"]}
+    assert items["c3"]["text"] == "本条说明自身 [[2]]"
+
+
+def test_duplicate_keeps_broken_refs_broken():
+    bodies = _bodies(import_text(GOOD).json())
+    # 删除 c4：c3 中 [[c4]] 失效；复制 c3 后副本中的失效引用仍失效
+    order = ["c1", "c2", "c3"]
+    bodies3 = [b for b in bodies if b["id"] != "c4"]
+    r = _dup(order, bodies3, ["c3"], 4)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["order_ids"] == ["c1", "c2", "c3", "c5"]
+    by = {c["id"]: c["body"] for c in data["clauses"]}
+    assert by["c5"] == "争议解决见 [[c4]]，违约参照 [[c2]]"
+    r = client.post("/api/preview", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    preview = r.json()
+    assert preview["has_broken"] is True
+    c5 = next(it for it in preview["items"] if it["id"] == "c5")
+    assert c5["broken"] == [{"ref_id": "c4", "original": 4}]
+    assert "[[原4?]]" in c5["text"]
+    r = client.post("/api/export", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    assert r.status_code == 409
+
+
+def test_duplicate_in_reordered_doc_inserts_after_last_selected_in_display_order():
+    bodies = _bodies(import_text(GOOD).json())
+    order = ["c4", "c1", "c2", "c3"]
+    # 传入顺序与显示顺序无关：按显示顺序 c1（第 2 位）、c3（第 4 位）分配身份
+    r = _dup(order, bodies, ["c3", "c1"], 4)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # 整组插在所选最后一条（显示顺序中的 c3）之后，其余条款相对顺序不变
+    assert data["order_ids"] == ["c4", "c1", "c2", "c3", "c5", "c6"]
+    by = {c["id"]: c["body"] for c in data["clauses"]}
+    assert by["c5"] == "甲方在七日内交付设备"  # c5 复制显示顺序中较前的 c1
+    assert by["c6"] == "争议解决见 [[c4]]，违约参照 [[c2]]"  # 组外引用保留原目标
+    r = client.post("/api/preview", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    items = {it["id"]: it for it in r.json()["items"]}
+    assert items["c5"]["display"] == 5
+    assert items["c6"]["display"] == 6
+    assert items["c6"]["text"] == "争议解决见 [[1]]，违约参照 [[3]]"
+
+
+def test_duplicate_rejects_empty_duplicate_and_missing_selection():
+    bodies = _bodies(import_text(GOOD).json())
+    # 未选择
+    r = _dup(ids4(), bodies, [], 4)
+    assert r.status_code == 422
+    # 选择重复
+    r = _dup(ids4(), bodies, ["c1", "c1"], 4)
+    assert r.status_code == 422
+    # 所选不存在
+    r = _dup(ids4(), bodies, ["c9"], 4)
+    assert r.status_code == 422
+    # 非法上界
+    r = _dup(ids4(), bodies, ["c1"], -1)
+    assert r.status_code == 422
+    # 失败不改草稿：原状态仍可正常预览
+    r = client.post("/api/preview", json={"order_ids": ids4(), "clauses": bodies})
+    assert r.status_code == 200
+    assert len(r.json()["items"]) == 4
+
+
+def test_duplicate_count_limit_40():
+    text = "\n".join(f"{i}|条款{i}" for i in range(1, 41))  # 40 条
+    bodies = _bodies(import_text(text).json())
+    order = [f"c{i}" for i in range(1, 41)]
+    # 40 条时复制 1 条即超上限：拒绝
+    r = _dup(order, bodies, ["c1"], 40)
+    assert r.status_code == 422
+    # 39 条时复制 1 条达 40 条：允许
+    r = _dup(order[:-1], bodies[:-1], ["c1"], 39)
+    assert r.status_code == 200, r.text
+    assert r.json()["order_ids"] == ["c1", "c40"] + [f"c{i}" for i in range(2, 40)]
+    assert r.json()["next_id"] == 40
+    # 39 条时复制 2 条达 41 条：拒绝
+    r = _dup(order[:-1], bodies[:-1], ["c1", "c2"], 39)
+    assert r.status_code == 422
+
+
+def test_duplicate_new_ids_must_be_fresh_and_not_revive_broken_refs():
+    bodies = _bodies(import_text(GOOD).json())
+    # 上界过期：分配到的身份与现有条款冲突
+    r = _dup(ids4(), bodies, ["c1"], 2)
+    assert r.status_code == 422
+    # 删除 c4 后，c3 中 [[c4]] 失效；上界过期导致分配到 c4 会复活失效引用：拒绝
+    order = ["c1", "c2", "c3"]
+    bodies3 = [b for b in bodies if b["id"] != "c4"]
+    r = _dup(order, bodies3, ["c1"], 3)
+    assert r.status_code == 422
+    # 用真正高于已用上界的身份则成功，失效引用保持失效
+    r = _dup(order, bodies3, ["c1"], 4)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["order_ids"] == ["c1", "c5", "c2", "c3"]
+    assert data["next_id"] == 5
+    r = client.post("/api/preview", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    assert r.json()["has_broken"] is True
+
+
+def test_duplicate_shares_upper_bound_with_split():
+    bodies = _bodies(import_text(GOOD).json())
+    # 复制推进上界到 5：拆分须用更高的新身份，且不能复用已占用的 c5
+    r = _dup(ids4(), bodies, ["c1"], 4)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["next_id"] == 5
+    r = _split(data["order_ids"], data["clauses"], "c2", 2, "c5")
+    assert r.status_code == 422  # c5 已被副本占用
+    r = _split(data["order_ids"], data["clauses"], "c2", 2, "c6")
+    assert r.status_code == 200, r.text
+    # 拆分推进上界后，复制同样从更高身份起分配
+    data = r.json()
+    r = _dup(data["order_ids"], data["clauses"], ["c1"], 6)
+    assert r.status_code == 200, r.text
+    assert "c7" in r.json()["order_ids"]
+    assert r.json()["next_id"] == 7
+
+
+def test_diff_duplicate_marks_copies_added():
+    doc = import_text(GOOD).json()
+    base = _state(doc)
+    r = _dup(base["order_ids"], base["clauses"], ["c2"], 4)
+    assert r.status_code == 200, r.text
+    cur = {"order_ids": r.json()["order_ids"], "clauses": r.json()["clauses"]}
+    data = _diff(base, cur).json()
+    # 复制记副本（新身份）的新增，原条款不变；插入造成的平移不算移动
+    assert [(it["id"], it["tags"]) for it in data["items"]] == [("c5", ["added"])]
+    c5 = data["items"][0]
+    assert c5["baseline_no"] is None and c5["current_no"] == 3
+    assert c5["current_text"] == "乙方按 [[1]] 验收后付款"
+    assert data["invalid_refs"] == []
+
+
+# --------------------------------------------------------------------------- #
 # 原稿对照 /api/diff
 # --------------------------------------------------------------------------- #
 def _state(doc, order=None):
